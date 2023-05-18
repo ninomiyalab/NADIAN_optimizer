@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Created on Wed Oct  6 09:38:38 2021
-@author: yryo1
 """
 
 from __future__ import absolute_import
