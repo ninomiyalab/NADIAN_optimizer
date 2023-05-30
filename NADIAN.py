@@ -1,104 +1,56 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Oct  6 09:38:38 2021
-"""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import abc
-import contextlib
-import functools
-import numpy as np
-import six
-import warnings
-
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.python.distribute import central_storage_strategy
-from tensorflow.python.distribute import distribution_strategy_context as distribute_ctx
-from tensorflow.python.distribute import parameter_server_strategy
-from tensorflow.python.distribute import parameter_server_strategy_v2
-from tensorflow.python.distribute import values as ds_values
-from tensorflow.python.eager import backprop
-from tensorflow.python.eager import context
-from tensorflow.python.eager import def_function
-from tensorflow.python.eager import monitoring
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
-from tensorflow.python.framework import tensor_util
-from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import clip_ops
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import gen_resource_variable_ops
-from tensorflow.python.ops import gradients
-from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import resource_variable_ops
-from tensorflow.python.ops import state_ops
-from tensorflow.python.ops import variables as tf_variables
-from tensorflow.python.saved_model import revived_types
-from tensorflow.python.training import training_ops
-from tensorflow.python.training.tracking import base as trackable
-from tensorflow.python.training.tracking import tracking
-from tensorflow.python.util import nest
-from tensorflow.python.util import tf_inspect
-from tensorflow.python.util.tf_export import keras_export
-from tensorflow.python.platform import tf_logging as logging
-from tensorflow.python.keras import backend_config
-from tensorflow.python.keras import backend
-from tensorflow.python.keras import initializers
-from tensorflow.python.keras.engine import base_layer_utils
-from tensorflow.python.keras.optimizer_v2 import learning_rate_schedule
-from tensorflow.python.keras.optimizer_v2 import optimizer_v2
-from tensorflow.python.keras.optimizer_v2 import utils as optimizer_utils
-from tensorflow.python.keras.utils import generic_utils
-from tensorflow.python.keras.utils import layer_utils
-from tensorflow.python.keras.utils import tf_inspect
-from tensorflow.python.keras.utils import tf_utils
+from tensorflow.keras import optimizers
 
-class NADIAN_Alt_B(keras.optimizers.Optimizer):
-    def __init__(self, learning_rate = 0.01, alpha = 0.5, beta = 0.1, momentum = 0.9, name = "NADIAN_Alt_B", **kwargs):
-        super().__init__(name, **kwargs)
-        self._set_hyper("learning_rate", kwargs.get("lr", learning_rate))
-        self._set_hyper("alpha", alpha)
-        self._set_hyper("beta", beta)
-        self._set_hyper("momentum", momentum)
+class Nadian(optimizers.Optimizer):
+    def __init__(self, learning_rate = 0.01, mu = 0.9, alpha = 0.5, beta = 0.1, name = "Nadian"):
+        super().__init__(name = name)
+        # 学習率の設定には _build_learning_rate 関数を用いる
+        self._learning_rate = self._build_learning_rate(learning_rate)
+        self._mu = mu
+        self._alpha = alpha
+        self._beta = beta
     
-    def _create_slots(self, var_list):
-        for var in var_list:
-            self.add_slot(var, 'z')
-            self.add_slot(var, "tmp_var")
-            self.add_slot(var, "past_var")
-    
-    def minimize(self, loss, var_list, grad_loss=None, name=None, tape=None):
-        # var(パラメータ)をネステロフ勾配の形に変換するメソッド
-        self.set_params_as_nesterov(var_list)
-        # 勾配を計算するメソッド
-        grads_and_vars = self._compute_gradients(loss, var_list=var_list, grad_loss=grad_loss, tape=tape)
-        # パラメータを更新するメソッド
-        return self.apply_gradients(grads_and_vars)
-    
-    """------------------------------------------"""
-    
-    # var(パラメータ)をネステロフ勾配の形に変換するメソッド
-    def set_params_as_nesterov(self, var_list):
-        self._create_all_weights(var_list)
-        mu = self._get_hyper("momentum")
+    # build 関数は保持する変数を定義する関数
+    def build(self, var_list):
+        
+        super().build(var_list)
+        # build 関数はイテレーション毎に呼び出されるので, 初めの1度のみ処理されるようにする
+        if hasattr(self, "_built") and self._built:
+            return
+        self._built = True
 
-        for var in var_list:
-            past_var = self.get_slot(var, "past_var")
-            tmp_var = self.get_slot(var, "tmp_var")
-            tmp_var_t = tmp_var.assign(var)
-            var.assign(var + mu * (var - past_var))
-            past_var.assign(tmp_var_t)
-                            
-    """------------------------------------------"""
+        # 
+        self._y = list()
+        # 1イテレーション前のパラメータを保持する変数
+        self._past_variables = list()
+        for variable in var_list:
+            self._y.append(
+                self.add_variable_from_reference(
+                    model_variable = variable, variable_name = "y",
+                    # 初期値は0
+                    initial_value = tf.zeros(shape = variable.shape)
+                )
+            )
+            self._past_variables.append(
+                self.add_variable_from_reference(
+                    model_variable = variable, variable_name = "past_variable",
+                    # 初期値はパラメータと同じ
+                    initial_value = variable
+                )
+            )
     
-    # 勾配を計算するメソッド
-    def _compute_gradients(self, loss, var_list, grad_loss=None, tape=None):
+    # ネステロフの加速勾配を求めるように編集
+    def compute_gradients(self, loss, var_list, tape=None):
+        # build関数を呼び出さないと保持する変数が定義されないので, ここで呼び出し
+        self.build(var_list)
 
-        tape = tape if tape is not None else backprop.GradientTape()
+        if not callable(loss) and tape is None:
+            raise ValueError(
+                "`tape` is required when a `Tensor` loss is passed. "
+                f"Received: loss={loss}, tape={tape}."
+            )
+        if tape is None:
+            tape = tf.GradientTape()
         if callable(loss):
             with tape:
                 if not callable(var_list):
@@ -107,79 +59,45 @@ class NADIAN_Alt_B(keras.optimizers.Optimizer):
                 if callable(var_list):
                     var_list = var_list()
         
-        with tape:
-            loss = self._transform_loss(loss)
-        var_list = nest.flatten(var_list)
+        # ネステロフの加速勾配の形にパラメータを変更
+        tmp_variables = list()
+        for variable in var_list:
+            var_key = self._var_key(variable)
+            past_variable = self._past_variables[self._index_dict[var_key]]
+            mu = tf.cast(self._mu, variable.dtype)
+
+            # 今のパラメータを保持
+            tmp_variables.append( variable.value() )
+            # パラメータをネステロフの加速勾配の形に変更
+            variable.assign(variable + mu * (variable - past_variable))
+
+        # ネステロフの加速勾配    
+        grads = tape.gradient(loss, var_list)
+
+        # パラメータを元の形に変更
+        for variable, tmp_variable in zip(var_list, tmp_variables):
+            variable.assign(tmp_variable)
+
+        return list(zip(grads, var_list))
+    
+    def update_step(self, gradient, variable):
+        # ハイパーパラメータはパラメータと同じデータ型にキャストする
+        learning_rate = tf.cast(self._learning_rate, variable.dtype)
+        alpha = tf.cast(self._alpha, variable.dtype)
+        beta = tf.cast(self._beta, variable.dtype)
+
+        # 保持する変数を取得するためのキー
+        var_key = self._var_key(variable)
+
+        # yを取得
+        y = self._y[self._index_dict[var_key]]
+        past_variable = self._past_variables[self._index_dict[var_key]]
         
-        with ops.name_scope_v2(self._name + "/gradients"):
-            grads = tape.gradient(loss, var_list, grad_loss)
-            grads_and_vars = list(zip(grads, var_list))
-        self._assert_valid_dtypes([v for g, v in grads_and_vars if g is not None and v.dtype != dtypes.resource])
-
-        return grads_and_vars
-    
-    """------------------------------------------"""
-    
-    # パラメータを更新するメソッド
-    def apply_gradients(self, grads_and_vars):
-        grads_and_vars = optimizer_utils.filter_empty_gradients(grads_and_vars)
-        var_list = [v for (_, v) in grads_and_vars]
-
-        with ops.name_scope_v2(self._name):
-            with ops.init_scope():
-                self._create_all_weights(var_list)
-            distribution = distribute_ctx.get_strategy()
-
-            def apply_grad_to_update_var(var, grad):
-                update_op = self._resource_apply_dense(grad, var)
-                return update_op
-            
-            eagerly_outside_functions = ops.executing_eagerly_outside_functions()
-            update_ops = []
-            with name_scope_only_in_function_or_graph(self._name):
-                for grad, var in grads_and_vars:
-                    with distribution.extended.colocate_vars_with(var):
-                        with name_scope_only_in_function_or_graph("update" if eagerly_outside_functions else "update_" + var.op.name):
-                            update_op = distribution.extended.update(var, apply_grad_to_update_var, args=(grad,), group=False)
-                            update_ops.append(update_op)
-            
-            with ops.control_dependencies([control_flow_ops.group(update_ops)]):
-                return self._iterations.assign_add(1, read_value=False)
-    
-    """------------------------------------------"""
-    
-    @tf.function
-    def _resource_apply_dense(self, grad, var):
-        var_dtype = var.dtype.base_dtype
-        
-        lr = self._get_hyper("learning_rate", var_dtype)
-        alpha = self._get_hyper("alpha", var_dtype)
-        beta = self._get_hyper("beta", var_dtype)
-        mu = self._get_hyper("momentum", var_dtype)
-        tmp_var = self.get_slot(var, "tmp_var")
-        
-        z = self.get_slot(var, "z")
-        if tf.cast(self.iterations, "int64") == 0:
-            z_t = (1. - alpha * beta) * tmp_var - beta ** 2 * grad
-        else:
-            z_t = z
-        
-        var.assign( tmp_var + lr * ((1 / beta - alpha) * tmp_var - z_t / beta - beta * grad) )
-        z.assign( z_t + lr * ((1 / beta - alpha) * tmp_var - z_t / beta) )
-
-    
-    def get_config(self):
-        base_config = super().get_config()
-        return {
-            **base_config,
-            "learning_rate" : self._serialize_hyperparameter("learning_rate"),
-            "alpha" : self._serialize_hyperparameter("alpha"),
-            "beta" : self._serialize_hyperparameter("beta"),
-            "momentum" : self._serialize_hyperparameter("momentum"),
-        }
-
-def name_scope_only_in_function_or_graph(name):
-    if not context.executing_eagerly():
-        return ops.name_scope_v1(name)
-    else:
-        return NullContextmanager()
+        # 更新前のパラメータを保持
+        tmp_variable = variable.value()
+        # パラメータは assign 関数で更新する
+        variable.assign( variable + learning_rate * ( ((1/beta) - alpha) * variable - (1/beta) * y - beta * gradient ) )
+        # yを更新
+        y.assign( y + learning_rate * ( ((1/beta) - alpha) * tmp_variable - (1/beta) * y ) )
+        # 1イテレーション前のパラメータを更新
+        past_variable.assign( tmp_variable )
